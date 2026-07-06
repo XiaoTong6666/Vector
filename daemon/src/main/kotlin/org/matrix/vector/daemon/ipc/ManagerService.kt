@@ -417,7 +417,7 @@ object ManagerService : ILSPManagerService.Stub() {
   override fun restartFor(intent: Intent) {} // No-op matching original
 
   override fun clearApplicationProfileData(packageName: String) {
-    packageManager?.clearApplicationProfileData(packageName)
+    packageManager?.clearApplicationProfileDataCompat(packageName)
   }
 
   override fun enableStatusNotification() = PreferenceStore.isStatusNotificationEnabled()

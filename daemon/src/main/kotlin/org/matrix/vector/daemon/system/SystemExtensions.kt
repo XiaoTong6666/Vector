@@ -28,6 +28,34 @@ const val MATCH_ALL_FLAGS =
         PackageManager.MATCH_UNINSTALLED_PACKAGES or
         MATCH_ANY_USER
 
+private val clearApplicationProfileDataMethod: Method? by lazy {
+  IPackageManager::class
+      .java
+      .methods
+      .find {
+        it.name == "clearApplicationProfileData" &&
+            it.parameterTypes.contentEquals(arrayOf(String::class.java))
+      }
+      ?.apply { isAccessible = true }
+}
+
+fun IPackageManager.clearApplicationProfileDataCompat(packageName: String): Boolean {
+  val method = clearApplicationProfileDataMethod
+  if (method == null) {
+    Log.w(
+        TAG,
+        "Runtime IPackageManager lacks clearApplicationProfileData; skipping profile clear for $packageName")
+    return false
+  }
+
+  return runCatching {
+        method.invoke(this, packageName)
+        true
+      }
+      .onFailure { Log.e(TAG, "clearApplicationProfileDataCompat failed", it.cause ?: it) }
+      .getOrDefault(false)
+}
+
 @Throws(Exception::class)
 private fun IPackageManager.getPackageInfoCompatThrows(
     packageName: String,
