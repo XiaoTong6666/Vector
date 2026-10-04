@@ -20,7 +20,15 @@ option(LSPLANT_BUILD_SHARED OFF)
 option(Plugin.SymbolResolver OFF)
 option(FMT_INSTALL OFF)
 
-add_subdirectory(dobby)
+# Vector defaults to the XiaoTong6666/Dobby fork. Keep the path override so CI
+# and cross-project reviews can exercise an exact Dobby checkout without
+# rewriting the submodule working tree.
+set(VECTOR_DOBBY_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/dobby" CACHE PATH "Dobby source used by Vector")
+set(DOBBY_GENERATE_SHARED OFF CACHE BOOL "Embed Dobby statically" FORCE)
+add_subdirectory("${VECTOR_DOBBY_ROOT}" "${CMAKE_CURRENT_BINARY_DIR}/dobby")
+if(TARGET dobby AND NOT TARGET dobby_static)
+    add_library(dobby_static ALIAS dobby)
+endif()
 add_subdirectory(fmt)
 add_subdirectory(lsplant/lsplant/src/main/jni)
 target_compile_options(lsplant_static PUBLIC -Wno-gnu-anonymous-struct

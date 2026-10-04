@@ -4,11 +4,12 @@
 
 #include <algorithm>
 #include <functional>
-#include <list>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
 
 #include "common/logging.h"
+#include "core/native_module_registry.h"
 #include "elf/elf_image.h"
 #include "elf/symbol_cache.h"
 
@@ -82,12 +83,16 @@ using lsplant::operator""_sym;
 namespace vector::native {
 
 namespace {
-// Mutex to protect access to the global module lists.
-std::mutex g_module_registry_mutex;
-// List of callback functions provided by loaded native modules.
-std::list<NativeOnModuleLoaded> g_module_loaded_callbacks;
-// List of native library filenames that are registered as modules.
-std::list<std::string> g_module_native_libs;
+NativeModuleRegistry<NativeOnModuleLoaded> g_module_registry;
+#if defined(DOBBY_HOOK_TRANSACTION_API_VERSION)
+std::mutex g_dobby_ownership_mutex;
+std::unordered_map<void *, DobbyHookOwnership> g_dobby_ownership;
+#endif
+
+struct NativeApiStorage {
+    NativeAPIEntries v2;
+    NativeAPIEntriesV3 v3;
+};
 
 // A smart pointer to a memory page that will hold the NativeAPIEntries struct.
 std::unique_ptr<void, std::function<void(void *)>> g_api_page(
@@ -98,8 +103,33 @@ std::unique_ptr<void, std::function<void(void *)>> g_api_page(
     });
 }  // namespace
 
+#if defined(DOBBY_HOOK_TRANSACTION_API_VERSION)
+bool LookupDobbyHookOwnership(void *target, DobbyHookOwnership *ownership) {
+    if (target == nullptr || ownership == nullptr) return false;
+    std::lock_guard<std::mutex> lock(g_dobby_ownership_mutex);
+    const auto it = g_dobby_ownership.find(target);
+    if (it == g_dobby_ownership.end()) return false;
+    *ownership = it->second;
+    return true;
+}
+
+void StoreDobbyHookOwnership(void *target, DobbyHookHandle handle, DobbyHookOwnershipState state) {
+    if (target == nullptr || handle == 0) return;
+    std::lock_guard<std::mutex> lock(g_dobby_ownership_mutex);
+    g_dobby_ownership[target] = DobbyHookOwnership{handle, state};
+}
+
+void ForgetDobbyHookOwnership(void *target, DobbyHookHandle handle) {
+    std::lock_guard<std::mutex> lock(g_dobby_ownership_mutex);
+    const auto it = g_dobby_ownership.find(target);
+    if (it != g_dobby_ownership.end() && it->second.handle == handle)
+        g_dobby_ownership.erase(it);
+}
+#endif
+
 // The read-only, statically available Native API entry points for modules.
 const NativeAPIEntries *g_native_api_entries = nullptr;
+const NativeAPIEntriesV3 *g_native_api_entries_v3 = nullptr;
 
 /**
  * @brief Initializes the Native API entries struct and makes it read-only.
@@ -110,21 +140,31 @@ void InitializeApiEntries() {
         LOGD("Release the memory page pointer %p", g_api_page.release());
         return;
     }
-    auto *entries = new (g_api_page.get()) NativeAPIEntries{
-        .version = 2,
-        .hookFunc = &HookInline,
-        .unhookFunc = &UnhookInline,
+    auto *storage = new (g_api_page.get()) NativeApiStorage{
+        .v2 = {.version = 2, .hookFunc = &HookInline, .unhookFunc = &UnhookInline},
+        .v3 = {
+            .base = {.version = 3, .hookFunc = &HookInline, .unhookFunc = &UnhookInline},
+            .struct_size = sizeof(NativeAPIEntriesV3),
+            .reserved = 0,
+            .hookWithPublication = &HookInlineWithPublication,
+        },
     };
     if (mprotect(g_api_page.get(), 4096, PROT_READ) != 0) {
         PLOGE("Failed to mprotect API page to read-only");
+        return; // Do not publish a mutable or incompletely initialized ABI page.
     }
-    g_native_api_entries = entries;
+    g_native_api_entries = &storage->v2;
+    g_native_api_entries_v3 = &storage->v3;
     LOGI("Native API entries initialized and protected.");
 }
 
 void RegisterNativeLib(const std::string &library_name) {
     static bool is_initialized = []() {
         InitializeApiEntries();
+        if (g_native_api_entries == nullptr) {
+            LOGE("Cannot initialize Native API without a protected entries page.");
+            return false;
+        }
         return InstallNativeAPI(lsplant::InitInfo{
             .inline_hooker =
                 [](void *target, void *replacement) {
@@ -142,16 +182,12 @@ void RegisterNativeLib(const std::string &library_name) {
         return;
     }
 
-    std::lock_guard<std::mutex> lock(g_module_registry_mutex);
-    // The list is walked on every dlopen in the process and never shrinks - there is no
-    // unregistration, and hot reload records a module's names again for each new generation - so
-    // without this it grows without bound and every dlopen pays for the duplicates.
-    if (std::find(g_module_native_libs.begin(), g_module_native_libs.end(), library_name) !=
-        g_module_native_libs.end()) {
+    // Native API v2 has no unregister operation. Deduplicate names so repeated
+    // Java registration cannot grow loader work without bound.
+    if (!g_module_registry.RegisterLibrary(library_name)) {
         LOGD("Native module library '{}' is already registered.", library_name.c_str());
         return;
     }
-    g_module_native_libs.push_back(library_name);
     LOGD("Native module library '{}' has been registered.", library_name.c_str());
 }
 
@@ -173,28 +209,53 @@ inline static auto do_dlopen_hook =
 
     if (handle == nullptr) return nullptr;
 
-    std::lock_guard<std::mutex> lock(g_module_registry_mutex);
+    // Never call code from an external native module under the registry
+    // mutex: native_init/onModuleLoaded can register modules, resolve symbols,
+    // or dlopen dependencies, and any nested loader callback would reenter us.
+    const auto registered_modules = g_module_registry.SnapshotLibraries();
 
-    for (std::string_view module_lib : g_module_native_libs) {
+    NativeOnModuleLoaded newly_initialized = nullptr;
+    for (std::string_view module_lib : registered_modules) {
         if (HasEnding(lib_name, module_lib)) {
             LOGI("Detected registered native module being loaded: '{}'", lib_name.c_str());
-            void *init_sym = dlsym(handle, "native_init");
+            void *init_sym = nullptr;
+#if defined(DOBBY_HOOK_TRANSACTION_API_VERSION) && \
+    (defined(__aarch64__) || defined(__x86_64__))
+            init_sym = dlsym(handle, "native_init_v3");
+            if (init_sym != nullptr && g_native_api_entries_v3 != nullptr) {
+                auto native_init_v3 = reinterpret_cast<NativeInitV3>(init_sym);
+                newly_initialized = native_init_v3(g_native_api_entries_v3);
+                LOGD("Initialized native module '{}' through strict Native API v3.",
+                     lib_name.c_str());
+                break;
+            }
+#endif
+            init_sym = dlsym(handle, "native_init");
             if (init_sym == nullptr) {
-                LOGW("Library '{}' matches a module name but does not export 'native_init'.",
+                LOGW("Library '{}' matches a module name but exports neither usable native_init_v3 nor native_init.",
                      lib_name.c_str());
                 break;
             }
             auto native_init = reinterpret_cast<NativeInit>(init_sym);
-            if (auto callback = native_init(g_native_api_entries)) {
-                g_module_loaded_callbacks.push_back(callback);
-                LOGI("Initialized native module '{}' and registered its callback.",
-                     lib_name.c_str());
-            }
+            newly_initialized = native_init(g_native_api_entries);
             break;
         }
     }
 
-    for (const auto &callback : g_module_loaded_callbacks) {
+    if (newly_initialized != nullptr) {
+        // This prevents repeated dlopen of one resident module from
+        // accumulating the same callback. It does NOT unregister callbacks or
+        // make an old module safe to unload.
+        if (g_module_registry.RegisterCallback(newly_initialized)) {
+            LOGI("Initialized native module '{}' and registered its callback.",
+                 lib_name.c_str());
+        } else {
+            LOGD("Native module '{}' returned an already registered callback.",
+                 lib_name.c_str());
+        }
+    }
+    const auto callbacks = g_module_registry.SnapshotCallbacks();
+    for (const auto &callback : callbacks) {
         callback(name, handle);
     }
 

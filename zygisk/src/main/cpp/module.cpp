@@ -60,6 +60,17 @@ private:
     obfuscation_map_t obfuscation_map_;
 };
 
+template <typename InitInfo>
+void ConfigurePublicationAwareHooker(InitInfo &info) {
+    if constexpr (requires(InitInfo &candidate) { candidate.inline_hooker_with_publication; }) {
+        info.inline_hooker_with_publication =
+            [](void *target, void *replace, void *user_data, auto publish) {
+                return HookInlineWithPublication(target, replace, user_data, publish) ==
+                       NATIVE_HOOK_OK;
+            };
+    }
+}
+
 /**
  * @class VectorModule
  * @brief The core implementation of the Zygisk module for the Vector framework.
@@ -115,20 +126,25 @@ private:
     JNIEnv *env_ = nullptr;
 
     // --- ART Hooker Configuration ---
-    const lsplant::InitInfo init_info_{
-        .inline_hooker =
-            [](auto target, auto replace) {
-                void *backup = nullptr;
-                return HookInline(target, replace, &backup) == 0 ? backup : nullptr;
+    const lsplant::InitInfo init_info_ = [] {
+        lsplant::InitInfo info{
+            .inline_hooker =
+                [](auto target, auto replace) {
+                    void *backup = nullptr;
+                    return HookInline(target, replace, &backup) == 0 ? backup : nullptr;
+                },
+            .inline_unhooker = [](auto target) { return UnhookInline(target) == 0; },
+            .art_symbol_resolver =
+                [](auto symbol) { return ElfSymbolCache::GetArt()->getSymbAddress(symbol); },
+            .art_symbol_prefix_resolver = [](auto symbol) {
+                return ElfSymbolCache::GetArt()->getSymbPrefixFirstAddress(symbol);
             },
-        .inline_unhooker = [](auto target) { return UnhookInline(target) == 0; },
-        .art_symbol_resolver =
-            [](auto symbol) { return ElfSymbolCache::GetArt()->getSymbAddress(symbol); },
-        .art_symbol_prefix_resolver =
-            [](auto symbol) { return ElfSymbolCache::GetArt()->getSymbPrefixFirstAddress(symbol); },
-        .generated_class_name = "Vector_",
-        .generated_source_name = "Dobby",
-    };
+            .generated_class_name = "Vector_",
+            .generated_source_name = "Dobby",
+        };
+        ConfigurePublicationAwareHooker(info);
+        return info;
+    }();
 
     // State managed within the class instance for each forked process.
     bool should_inject_ = false;
@@ -354,7 +370,15 @@ void VectorModule::postAppSpecialize(const zygisk::AppSpecializeArgs *args) {
     close(dex_fd);  // The FD is duplicated by mmap, we can close it now.
 
     // Initialize ART hooks via the native library.
-    this->InitArtHooker(env_, init_info_);
+    if (!this->InitArtHooker(env_, init_info_)) {
+        LOGE("Aborting Java/Xposed initialization for '{}' after LSPlant failure.",
+             nice_name_str.get());
+        // A failed lsplant::Init may have installed part of an ART hook.
+        // Keep this library resident until its actual physical cleanup can
+        // be proved; unloading would invalidate its trampoline callbacks.
+        SetAllowUnload(false);
+        return;
+    }
     // Initialize JNI hooks via the native library.
     this->InitHooks(env_);
     // Find the Java entrypoint.
@@ -450,7 +474,11 @@ void VectorModule::postServerSpecialize(const zygisk::ServerSpecializeArgs *args
 
     ipc_bridge.HookBridge(env_);
 
-    this->InitArtHooker(env_, init_info_);
+    if (!this->InitArtHooker(env_, init_info_)) {
+        LOGE("Aborting Java/Xposed initialization in system_server after LSPlant failure.");
+        SetAllowUnload(false);
+        return;
+    }
     this->InitHooks(env_);
     this->SetupEntryClass(env_);
 

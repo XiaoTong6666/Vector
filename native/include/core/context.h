@@ -206,7 +206,9 @@ protected:
     // --- Virtual methods for platform-specific implementations ---
 
     /// Initializes the ART hooking framework (LSPlant).
-    virtual void InitArtHooker(JNIEnv *env, const lsplant::InitInfo &initInfo);
+    // LSPlant failure may leave partially installed ART trampolines. The
+    // caller must not run dependent JNI/Java hook initialization afterward.
+    virtual bool InitArtHooker(JNIEnv *env, const lsplant::InitInfo &initInfo);
 
     /// Registers all necessary JNI bridges and native hooks.
     virtual void InitHooks(JNIEnv *env);

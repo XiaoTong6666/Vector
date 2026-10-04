@@ -31,6 +31,7 @@ val versionHashProvider = rootProject.extra["versionHashProvider"] as Provider<S
 val injectedPackageName = rootProject.extra["injectedPackageName"] as String
 val injectedPackageUid = rootProject.extra["injectedPackageUid"] as Int
 val defaultManagerPackageName = rootProject.extra["defaultManagerPackageName"] as String
+val testDobbyRoot = providers.environmentVariable("VECTOR_DOBBY_ROOT")
 
 android {
     namespace = "org.matrix.vector"
@@ -52,6 +53,9 @@ android {
             cmake {
                 cFlags.addAll(flags)
                 cppFlags.addAll(flags)
+                testDobbyRoot.orNull?.let {
+                    arguments += "-DVECTOR_DOBBY_ROOT=$it"
+                }
             }
         }
     }
